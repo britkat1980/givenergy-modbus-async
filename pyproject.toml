@@ -1,10 +1,10 @@
 [tool]
 [tool.poetry]
-name = "givenergy-modbus"
-version = "1.0.0"
-homepage = "https://github.com/dewet22/givenergy-modbus"
+name = "givenergy-modbus-async"
+version = "2.0.0"
+homepage = "https://github.com/britkat1980/givenergy-modbus-async"
 description = "A python library to access GivEnergy inverters via Modbus TCP, with no dependency on the GivEnergy Cloud."
-authors = ["Dewet Diener <givenergy-modbus@dewet.org>"]
+authors = ["Britkat1980 mark@marksweb.org.uk"]
 readme = "README.md"
 license =  "Apache-2.0"
 classifiers=[
@@ -23,14 +23,14 @@ classifiers=[
     'Topic :: System :: Networking :: Monitoring',
 ]
 packages = [
-    { include = "givenergy_modbus" },
+    { include = "givenergy_modbus_async" },
     { include = "tests", format = "sdist" },
 ]
 
 [tool.poetry.dependencies]
 aiofiles = "^0.8.0"
 crccheck = "^1.1"
-python = ">=3.11,<3.12"
+python = ">=3.13.9"
 aenum = "^3.1.12"
 typing_extensions = ">= 4.5.0"
 

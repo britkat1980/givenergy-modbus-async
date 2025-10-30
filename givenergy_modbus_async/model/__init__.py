@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import time
 from enum import IntEnum
 from typing import TYPE_CHECKING
+import json
 
 if TYPE_CHECKING:
     from .register_cache import (
@@ -62,6 +63,26 @@ class TimeSlot:
         end_minute = int(end[-2:])
         try:
             return cls(time(start_hour, start_minute), time(end_hour, end_minute))
-        except:
-            # if there's garbage data return midnight
-            return cls(time(0,0), time(0,0))
+        except Exception:
+            # if there's garbage data return a TimeSlot with None values
+            return cls(None, None)
+
+    def to_list(self) -> list:
+        """Return [start, end]. Times are returned as time objects or None."""
+        return [self.start, self.end]
+
+    def to_json(self) -> str:
+        """Return a small JSON object with HH:MM strings or null for empty times."""
+        def fmt(t):
+            return t.strftime("%H:%M") if t else None
+        slot = {"start": fmt(self.start), "end": fmt(self.end)}
+        return json.dumps(slot)
+    
+    def to_dict(self) -> str:
+        """Return a small JSON object with HH:MM strings or null for empty times."""
+        def fmt(t):
+            return t.strftime("%H:%M") if t else None
+        slot={}
+        slot['start'] =  fmt(self.start)
+        slot["end"] = fmt(self.end)
+        return slot

@@ -47,6 +47,11 @@ class Client:
         self.framer = ClientFramer()
         self.plant = Plant()
         self.tx_queue = Queue(maxsize=20)
+        # Maximum time (seconds) to wait for socket read before re-checking
+        # this prevents reader.read(...) from blocking forever if the
+        # remote peer becomes silent. Small value (e.g. 5s) is sufficient
+        # to allow occasional idle periods while still allowing cancellation.
+        self.read_timeout = 7.0
         # self.debug_frames = {
         #     'all': Queue(maxsize=1000),
         #     'error': Queue(maxsize=1000),
@@ -77,35 +82,70 @@ class Client:
 
     async def close(self) -> None:
         """Disconnect from the remote host and clean up tasks and queues."""
+        # Make close idempotent and resilient to partially-constructed
+        # client state. Ensure tasks are cancelled first, but don't block
+        # indefinitely waiting for them.
         if not self.connected:
             return
 
         _logger.debug("Disconnecting and cleaning up")
 
+        # Mark disconnected immediately so other tasks can observe state
         self.connected = False
 
+        # Cancel background tasks (consumer then producer) and await them
+        # with a short timeout so close() doesn't hang forever.
+        if getattr(self, "network_consumer_task", None):
+            self.network_consumer_task.cancel()
+            try:
+                await asyncio.wait_for(self.network_consumer_task, timeout=2.0)
+            except Exception:
+                # task may have already finished or refused to cancel quickly
+                pass
+
+        if getattr(self, "network_producer_task", None):
+            self.network_producer_task.cancel()
+            try:
+                await asyncio.wait_for(self.network_producer_task, timeout=2.0)
+            except Exception:
+                pass
+
+        # Cancel any pending futures stored in tx_queue
         if self.tx_queue:
             while not self.tx_queue.empty():
-                _, future = self.tx_queue.get_nowait()
+                try:
+                    _, future = self.tx_queue.get_nowait()
+                except Exception:
+                    break
                 if future:
                     future.cancel()
 
-        if self.network_producer_task:
-            self.network_producer_task.cancel()
-
+        # Close the writer but don't block forever waiting for wait_closed()
         if hasattr(self, "writer") and self.writer:
-            self.writer.close()
-            await self.writer.wait_closed()
-            del self.writer
+            try:
+                self.writer.close()
+                await asyncio.wait_for(self.writer.wait_closed(), timeout=2.0)
+            except Exception:
+                _logger.debug("Timed out or error waiting for writer to close")
+            try:
+                del self.writer
+            except Exception:
+                pass
 
-        if self.network_producer_task:
-            self.network_consumer_task.cancel()
-
+        # Safely tear down reader
         if hasattr(self, "reader") and self.reader:
-            self.reader.feed_eof()
-            self.reader.set_exception(RuntimeError("cancelling"))
-            del self.reader
+            try:
+                # unblock any pending read() callers
+                self.reader.feed_eof()
+                self.reader.set_exception(RuntimeError("cancelling"))
+            except Exception:
+                pass
+            try:
+                del self.reader
+            except Exception:
+                pass
 
+        # Clear expected responses map
         self.expected_responses = {}
         # self.debug_frames = {
         #     'all': Queue(maxsize=1000),
@@ -116,8 +156,11 @@ class Client:
         self,
         full_refresh: bool = True,
         number_batteries: int = 0,
+        meter_list: list[int] = [],
+        bcu_list: list[tuple]=[],
         timeout: float = 3,
         retries: int = 5,
+        return_exceptions: bool = False,
     ) -> Plant:
         """Refresh data about the Plant."""
 
@@ -125,9 +168,9 @@ class Client:
             full_refresh, number_batteries, isHV=self.plant.isHV, 
             additional_holding_registers=self.plant.additional_holding_registers,
             additional_input_registers=self.plant.additional_input_registers, 
-            slave_addr=self.plant.slave_address,
+            slave_addr=self.plant.slave_address,meter_list=meter_list,bcu_list=bcu_list
         )
-        await self.execute(reqs, timeout=timeout, retries=retries)
+        await self.execute(reqs, timeout=timeout, retries=retries, return_exceptions=return_exceptions)
         return self.plant
 
     async def watch_plant(
@@ -145,13 +188,39 @@ class Client:
         self.plant.detect_batteries()
         while True:
             if handler:
-                handler()
+                handler(self.plant)
             await asyncio.sleep(refresh_period)
             if not passive:
                 reqs = commands.refresh_plant_data(False, self.plant.number_batteries)
                 await self.execute(
                     reqs, timeout=timeout, retries=retries, return_exceptions=True
                 )
+
+    async def get_bcus(self) -> None:
+        """Determine the number of BCUs available in a device by getting BAMS data.
+        """
+        from ..model.register import IR
+        from ..pdu import ReadInputRegistersRequest
+        
+        # Get BAM data at 0xA0
+        self.plant.bcu_list=[]      #reset to no bcus at start of discovery
+        req=[]
+        req.append(
+            ReadInputRegistersRequest(
+                base_register=60, register_count=5, slave_address=0xA0
+            ))
+        await self.execute(req,timeout=2, retries=3, return_exceptions=True)
+        self.plant.number_bcus = self.plant.register_caches[0xA0][IR(61)]
+        req=[]
+        for bcu_num in range(self.plant.number_bcus):
+            req.append(
+            ReadInputRegistersRequest(
+                base_register=60, register_count=60, slave_address=0x70+bcu_num
+            ))
+        await self.execute(req,timeout=2, retries=3, return_exceptions=True)
+        for bcu_num in range(self.plant.number_bcus):
+            val=self.plant.register_caches[0x70+bcu_num][IR(64)]
+            self.plant.bcu_list.append([bcu_num,val])
 
     async def detect_plant(
         self,
@@ -169,7 +238,7 @@ class Client:
         #Force 0x11 slave address only during detect
         self.plant.slave_address=0x11
         self.plant.isHV = False
-
+        
         await self.refresh_plant(True, number_batteries=0, retries=retries, timeout=timeout)
 
         _logger.info("Plant Detected")
@@ -184,22 +253,37 @@ class Client:
         elif not self.plant.ems == None:
             self.plant.device_type=self.plant.ems.model
 
-        if self.plant.device_type in (Model.ALL_IN_ONE, Model.AC_3PH, Model.HYBRID_3PH):
+        if self.plant.device_type in (Model.ALL_IN_ONE, Model.AC_3PH, Model.HYBRID_3PH, Model.HYBRID_HV_GEN3, Model.ALL_IN_ONE_HYBRID):
             self.plant.isHV = True
         else:
             self.plant.isHV= False
+#            meter_list=[]
 
-        if self.plant.device_type in (Model.EMS,Model.GATEWAY):
-            self.plant.number_batteries=0
+        meter_list=[1,2,3,4,5,6,7,8]
+
+        #### Set whether a device has batteries and then count them if they are allowed ####
+        if self.plant.device_type in (Model.EMS,Model.GATEWAY, Model.HYBRID_GEN4):
+            await self.refresh_plant(True, number_batteries=0, meter_list=meter_list, bcu_list=self.plant.bcu_list, retries=retries, timeout=timeout, return_exceptions=True) #set return exceptions to true to allow meters to not be found
         else:
-            if self.plant.device_type in (Model.AC, Model.HYBRID):
+            if self.plant.device_type in (Model.AC, Model.HYBRID_GEN1):
                 self.plant.slave_address = 0x31
-            await self.refresh_plant(True, number_batteries=6, retries=retries, timeout=timeout)
+            #### Determine how many BCUs and then define the battery locations to look for, then set plant.number_bcus ####
+            if self.plant.isHV:
+                await self.get_bcus()
+            
+            #### Get max num of batteries for each BCU then test if they are valid ####
+            await self.refresh_plant(True, number_batteries=6, meter_list=meter_list, bcu_list=self.plant.bcu_list, retries=retries, timeout=timeout, return_exceptions=True) #set return exceptions to true to allow meters to not be found
             self.plant.detect_batteries()
+
+        self.plant.detect_meters()
         
             # Use that to detect the number of batteries
-        _logger.info("Batteries detected: %d", self.plant.number_batteries)
-        _logger.info("Slave address in use: "+ str(self.plant.slave_address))
+        _logger.debug("Batteries detected: %d", self.plant.number_batteries)
+        _logger.debug("Meters detected: %d", len(self.plant.meter_list))
+        _logger.debug("Slave address in use: "+ str(self.plant.slave_address))
+
+        #Get Meter Product Info
+
 
         # Some devices support additional registers
         # When unsupported, devices appear to simple ignore requests
@@ -286,58 +370,116 @@ class Client:
 
     async def _task_network_consumer(self):
         """Task for orchestrating incoming data."""
-        while hasattr(self, "reader") and self.reader and not self.reader.at_eof():
-            frame = await self.reader.read(300)
-            # await self.debug_frames['all'].put(frame)
-            for message in self.framer.decode(frame):
-                _logger.debug("Processing %s", message)
-                if isinstance(message, ExceptionBase):
-                    _logger.warning(
-                        "Expected response never arrived but resulted in exception: %s",
-                        message,
+        try:
+            while hasattr(self, "reader") and self.reader and not self.reader.at_eof():
+                # Protect reader.read from blocking forever by using a
+                # short wait_for timeout. If the timeout elapses we loop
+                # again which allows task cancellation to be observed.
+                try:
+                    frame = await asyncio.wait_for(
+                        self.reader.read(300), timeout=self.read_timeout
                     )
+                except asyncio.TimeoutError:
+                    # No data arrived within read_timeout, loop back and
+                    # check reader/connected state. This prevents a silent
+                    # peer from causing an indefinite hang.
                     continue
-                if isinstance(message, HeartbeatRequest):
-                    _logger.debug("Responding to HeartbeatRequest")
-                    await self.tx_queue.put(
-                        (message.expected_response().encode(), None)
-                    )
-                    continue
-                if not isinstance(message, TransparentResponse):
-                    _logger.warning(
-                        "Received unexpected message type for a client: %s", message
-                    )
-                    continue
-                if isinstance(message, WriteHoldingRegisterResponse):
-                    if message.error:
-                        _logger.warning("%s", message)
-                    else:
-                        _logger.info("%s", message)
+                # await self.debug_frames['all'].put(frame)
+                for message in self.framer.decode(frame):
+                    _logger.debug("Processing %s", message)
+                    if isinstance(message, ExceptionBase):
+                        _logger.warning(
+                            "Expected response never arrived but resulted in exception: %s",
+                            message,
+                        )
+                        continue
+                    if isinstance(message, HeartbeatRequest):
+                        _logger.debug("Responding to HeartbeatRequest")
+                        await self.tx_queue.put(
+                            (message.expected_response().encode(), None)
+                        )
+                        continue
+                    if not isinstance(message, TransparentResponse):
+                        _logger.warning(
+                            "Received unexpected message type for a client: %s", message
+                        )
+                        continue
+                    if isinstance(message, WriteHoldingRegisterResponse):
+                        if message.error:
+                            _logger.warning("%s", message)
+                        else:
+                            _logger.info("%s", message)
 
-                future = self.expected_responses.get(message.shape_hash())
+                    future = self.expected_responses.get(message.shape_hash())
 
-                if future and not future.done():
-                    future.set_result(message)
-                # try:
-                self.plant.update(message)
-                # except RegisterCacheUpdateFailed as e:
-                #     # await self.debug_frames['error'].put(frame)
-                #     _logger.debug(f'Ignoring {message}: {e}')
-        _logger.debug(
-            "network_consumer reader at EOF, cannot continue, closing connection"
-        )
-        await self.close()
+                    if future:
+                        try:
+                            if not future.done() and not future.cancelled():
+                                future.set_result(message)
+                        except Exception:
+                            # InvalidStateError can happen if the future was
+                            # completed/cancelled concurrently. Log and continue.
+                            _logger.debug(
+                                "Failed to set expected_responses future result (state=%s, cancelled=%s)",
+                                getattr(future, 'done', lambda: 'n/a')(),
+                                getattr(future, 'cancelled', lambda: 'n/a')(),
+                            )
+                    # try:
+                    self.plant.update(message)
+                    # except RegisterCacheUpdateFailed as e:
+                    #     # await self.debug_frames['error'].put(frame)
+                    #     _logger.debug(f'Ignoring {message}: {e}')
+            _logger.debug(
+                "network_consumer reader at EOF, cannot continue, closing connection"
+            )
+        except Exception:
+            _logger.exception("network_consumer reader exception")
+        finally:
+            await self.close()
 
     async def _task_network_producer(self, tx_message_wait: float = 0.25):
         """Producer loop to transmit queued frames with an appropriate delay."""
         while hasattr(self, "writer") and self.writer and not self.writer.is_closing():
-            message, future = await self.tx_queue.get()
-            self.writer.write(message)
-            await self.writer.drain()
-            self.tx_queue.task_done()
+            try:
+                message, future = await self.tx_queue.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                # Write and flush
+                self.writer.write(message)
+                await self.writer.drain()
+            except Exception:
+                _logger.exception("Error writing message to socket")
+                # If write fails, ensure task_done is called and re-raise to trigger close
+                try:
+                    self.tx_queue.task_done()
+                except Exception:
+                    pass
+                raise
+
+            # Mark queue item done
+            try:
+                self.tx_queue.task_done()
+            except Exception:
+                pass
+
+            # Safely complete the frame_sent future if still active
             if future:
-                future.set_result(True)
-            await asyncio.sleep(tx_message_wait)
+                try:
+                    if not future.done() and not future.cancelled():
+                        future.set_result(True)
+                except Exception:
+                    _logger.debug(
+                        "Failed to set tx_queue frame future (done=%s cancelled=%s)",
+                        getattr(future, 'done', lambda: 'n/a')(),
+                        getattr(future, 'cancelled', lambda: 'n/a')(),
+                    )
+
+            # Small delay between frames
+            try:
+                await asyncio.sleep(tx_message_wait)
+            except asyncio.CancelledError:
+                break
         _logger.debug(
             "network_producer writer is closing, cannot continue, closing connection"
         )
@@ -393,7 +535,10 @@ class Client:
                 _logger.debug(
                     "Cancelling existing in-flight request and replacing: %s", request
                 )
-                existing_response_future.cancel()
+                try:
+                    existing_response_future.cancel()
+                except Exception:
+                    _logger.debug("Failed to cancel existing response future")
             response_future: Future[
                 TransparentResponse
             ] = asyncio.get_event_loop().create_future()
@@ -418,6 +563,7 @@ class Client:
                     else:
                         return response
             except asyncio.TimeoutError:
+                await asyncio.sleep(0.5)
                 pass
 
             if tries <= retries:
@@ -428,10 +574,17 @@ class Client:
                     retries,
                 )
 
-        _logger.critical(
+        _logger.debug(
             "Timeout awaiting %s after %d tries at %ds, giving up",
             expected_response,
             tries,
             timeout,
         )
+        # Ensure we don't leave stale entries in expected_responses
+        try:
+            cur = self.expected_responses.get(expected_shape_hash)
+            if cur is response_future:
+                del self.expected_responses[expected_shape_hash]
+        except Exception:
+            pass
         raise asyncio.TimeoutError()
