@@ -83,7 +83,7 @@ class ReadRegistersRequest(ReadRegistersMessage, TransparentRequest, ABC):
         self._ensure_registers_spec_correct()
 
         if self.register_count != 1 and self.base_register % 60 != 0:
-            _logger.warning(
+            _logger.info(
                 f"Base register {self.base_register} not aligned on 60-byte boundary"
             )
         if self.register_count <= 0 or 60 < self.register_count:
@@ -221,14 +221,14 @@ class ReadInputRegistersResponse(ReadInputRegisters, ReadRegistersResponse):
         return
 
 
-class ReadBatteryInputRegisters(ReadRegistersMessage, ABC):
+class ReadMeterProductRegisters(ReadRegistersMessage, ABC):
     """Request & Response PDUs for function #4/Read Input Registers."""
 
-    transparent_function_code = 0x16
+    transparent_function_code = 22
 
 
-class ReadBatteryInputRegistersRequest(ReadBatteryInputRegisters, ReadRegistersRequest):
-    """Concrete PDU implementation for handling function #4/Read Input Registers request messages."""
+class ReadMeterProductRegistersRequest(ReadMeterProductRegisters, ReadRegistersRequest):
+    """Concrete PDU implementation for handling function #22/Read Meter Registers request messages."""
 
     def expected_response(self):
         return ReadInputRegistersResponse(
@@ -238,10 +238,10 @@ class ReadBatteryInputRegistersRequest(ReadBatteryInputRegisters, ReadRegistersR
         )
 
 
-class ReadBatteryInputRegistersResponse(
-    ReadBatteryInputRegisters, ReadRegistersResponse
+class ReadMeterProductRegistersResponse(
+    ReadMeterProductRegisters, ReadRegistersResponse
 ):
-    """Concrete PDU implementation for handling function #4/Read Input Registers response messages."""
+    """Concrete PDU implementation for handling function #22/Read Meter Registers response messages."""
 
     def expected_response(self):
         return
