@@ -1,4 +1,4 @@
-# GivEnergy Modbus
+# GivEnergy Modbus Async
 
 [![pypi](https://img.shields.io/pypi/v/givenergy-modbus.svg)](https://pypi.org/project/givenergy-modbus/)
 [![python](https://img.shields.io/pypi/pyversions/givenergy-modbus.svg)](https://pypi.org/project/givenergy-modbus/)
@@ -14,9 +14,9 @@ Cloud.
 > electricity doing SOC calibration: you **really** are on your own. We make every effort to prevent you from shooting
 > yourself in the foot, so as long as you use the client and its exposed methods, you should be perfectly safe.
 
-* Documentation: <https://hoggyhoggy.github.io/givenergy-modbus-async>
-* GitHub: <https://hoggyhoggy.github.io/givenergy-modbus-async>
-* PyPI: <https://pypi.org/project/givenergy-modbus/>
+* Documentation: <https://github.com/britkat1980/givenergy-modbus-async>
+* GitHub: <https://github.com/britkat1980/givenergy-modbus-async>
+* PyPI: <https://pypi.org/project/givenergy-modbus-async/>
 * Free software: Apache-2.0
 
 ## Features
@@ -38,11 +38,11 @@ from givenergy_modbus.model.plant import Plant, Inverter
 client = Client(host="192.168.99.99")
 await client.connect()
 
-await client.exec(commands.enable_charge_target(80))
+await client.execute(commands.enable_charge_target(80))
 # set a charging slot from 00:30 to 04:30
-await client.exec(commands.set_charge_slot_1((datetime.time(hour=0, minute=30), datetime.time(hour=4, minute=30)))
+await client.execute(commands.set_charge_slot_1((datetime.time(hour=0, minute=30), datetime.time(hour=4, minute=30)))
 # set the inverter to charge when there's excess, and discharge otherwise. it will also respect charging slots.
-await client.exec(commands.set_mode_dynamic())
+await client.execute(commands.set_mode_dynamic())
 
 client.refresh_plant(full_refresh=True)
 p = client.plant

@@ -1,7 +1,7 @@
 [tool]
 [tool.poetry]
 name = "givenergy-modbus-async"
-version = "2.0.4"
+version = "2.1"
 homepage = "https://github.com/britkat1980/givenergy-modbus-async"
 description = "A python library to access GivEnergy inverters via Modbus TCP, with no dependency on the GivEnergy Cloud."
 authors = ["Britkat1980 mark@marksweb.org.uk", "Dewet Denier"]
