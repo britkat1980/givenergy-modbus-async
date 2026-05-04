@@ -55,12 +55,13 @@ class TimeSlot:
         """Converts from human-readable/ASCII representation: '0034' -> 00:34."""
         if isinstance(start, int):
             start = f"{start:04d}"
-        start_hour = int(start[:-2])
-        start_minute = int(start[-2:])
+            # Check values for all timeslots meet 0..59 criteria
+            start_hour = (lambda v: (int(v) if 0 <= int(v) <= 59 else 0) if isinstance(v, (int, str)) else 0)(int(start[:-2]))
+            start_minute = (lambda v: (int(v) if 0 <= int(v) <= 59 else 0) if isinstance(v, (int, str)) else 0)(int(start[-2:]))
         if isinstance(end, int):
             end = f"{end:04d}"
-        end_hour = int(end[:-2])
-        end_minute = int(end[-2:])
+            end_hour = (lambda v: (int(v) if 0 <= int(v) <= 59 else 0) if isinstance(v, (int, str)) else 0)(int(end[:-2]))
+            end_minute = (lambda v: (int(v) if 0 <= int(v) <= 59 else 0) if isinstance(v, (int, str)) else 0)(int(end[-2:]))
         try:
             return cls(time(start_hour, start_minute), time(end_hour, end_minute))
         except Exception:
